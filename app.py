@@ -23,14 +23,30 @@ import os
 
 load_dotenv()
 
-MODEL = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+MODEL = ChatGoogleGenerativeAI(model="gemini-2.5-pro")
 VECTORSTORE = DocumentVectorStore()
 PATH = r"C:\Users\TGshi\Desktop\LangChain\AppLogic\docs"
 
+
 class Output(BaseModel):
-    Decision: Literal["Approved", "Rejected"] = Field(description="Approved or Rejected")
-    Amount: Optional[float] = Field(description="Any charges if applicable")
-    Justification: str = Field(description="Explaination on the decision taken with appropriate clause stated.")
+    """
+    A structured format for the final adjudication output.
+    """
+    Decision: Literal["Approved", "Rejected"] = Field(
+        ...,
+        description="Binary decision. Must default to 'Approved' if information is insufficient and checkpoints must be listed under justification."
+    )
+    
+    Amount: Optional[float] = Field(
+        default=None,
+        description="The approved monetary value. Only include if the Decision is 'Approved' and an amount is specified."
+    )
+
+    Justification: str = Field(
+        ...,
+        description="A complete explanation for the decision, which must include a direct quotation of the supporting policy clause(s) and checkpoints if any for claim."
+    )
+
 
 class AgentState(TypedDict):
     query : str
@@ -58,18 +74,16 @@ def RefineQuery(state : AgentState):
     
     refine_prompt = f"""
     You are a query refinement assistant for an insurance policy decision system.
-    
     Original query: {query}
-    
-    Your task is to refine this query to make it more specific and suitable for searching policy documents.
-    Focus on:
-    1. Identifying key insurance terms and concepts
-    2. Making the query more specific and remove any ambiguities with educated assumptions.
-    3. Don't explicitly add new content and change the meaning of original prompt. Keep it simple and original.
-    
-    Provide only the refined query, nothing else.
+    Your goal is to refine the given query so it is more precise and relevant for searching insurance policy documents.
+    Refinement rules:
+        -Preserve original meaning — do not add, remove, or replace key medical, financial, or policy terms.
+        -Clarify, not alter — you may expand abbreviations, fix grammar, or add necessary context from the query itself, but never introduce new procedures, conditions, or assumptions that are not explicitly stated.
+        -Enhance search relevance — identify important insurance-related keywords (e.g., coverage, claim eligibility, exclusions, pre-authorization) and incorporate them only if they are directly implied or stated.
+        -Remove vague or extraneous language to make the query concise and unambiguous.
+
+    Return only the refined query text, nothing else.
     """
-    
     response = MODEL.invoke([HumanMessage(content=refine_prompt)])
     refined_query = response.content
     
@@ -87,21 +101,40 @@ def InitialiseModel(state : AgentState):
     refined query will be then appended as HumanMessage for invoking the DecisionMaker model in the 
     next node and also to work with MemorySaver nicely.
     """
-    system_prompt = """You are an insurance policy decision assistant. Your role is to:
-    1. Analyze insurance queries against policy documents
-    2. Use the ClauseRetriever tool to search for relevant policy clauses
-    3. Make decisions based on the retrieved information
-    4. Provide clear justification for your decisions"""
+    system_prompt = """
+    You are an expert Insurance Policy Analyst AI. Your primary function is to adjudicate insurance queries by strictly interpreting policy documents. You must operate with objectivity, precision, and adherence to the provided information.
+
+    Your workflow is as follows:
+    1.  **Deconstruct the Query:** Identify the key facts, dates, and the specific question being asked by the user.
+    2.  **Retrieve Clauses:** Use the `ClauseRetriever` tool to find all relevant policy sections, including definitions, coverage grants, exclusions, and conditions related to the query.
+    3.  **Analyze and Synthesize:** Scrutinize the retrieved clauses. Compare the facts of the query directly against the policy language.
+    4.  **Formulate Determination:** Based *only* on the retrieved clauses, make a clear determination (Approved/Rejected).
+    5.  **Generate Final Output:** Based on your analysis, you must generate a structured output that conforms to the following schema. Do not output any other text or explanation outside of this structure.
+            1. *Decision:* (Required) This field must be either "Approved" or "Rejected".
+            If the policy language clearly supports the user's request, set this to "Approved".
+            If the policy language excludes, limits, or fails to cover the request, set this to "Rejected".
+            If the query lacks the necessary information to confirm coverage, you must default to "Approved" and Specify the unavailable information as requirement or checkpoints.
+            2. *Amount:* (Optional) This field is for a numeric value.
+            Include the approved monetary amount if the decision is "Approved" and an amount is specified or calculable.
+            If the decision is "Rejected" or if no specific amount is applicable to the decision, this field should be omitted.
+            3. *Justification:* (Required) This field is a string containing your complete reasoning.
+            You must provide a clear explanation for your Decision.
+            This explanation must include a direct quotation of the most critical policy clause(s) used to make the determination.
+
+    **CRITICAL CONSTRAINTS:**
+    * You must base your decision **solely** on the information retrieved from the policy document. Do not make assumptions or use external knowledge.
+    * You are not a lawyer or a financial advisor. **Never** provide legal advice, financial recommendations, or opinions on the fairness of a policy.
+    * If the provided information is insufficient to make a decision, your determination must be "More Information Needed" and you must specify what information is required.
+    """
     
-    messages = [
+    new_messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=state["query"])
     ]
     
-    return Command(
-        goto="decision-maker",
-        update={"messages": messages}
-    )
+    return {
+        "messages": new_messages
+    }
 
 def DecisionMaker(state : AgentState):
     """
@@ -136,9 +169,9 @@ def OutputStructurer(state : AgentState):
     {last_message.content}
     
     Extract and format the information into:
-    - Decision: "Approved" or "Rejected"
-    - Amount: Any charges if applicable (as a number, or null if none)
-    - Justification: Clear explanation with policy clauses mentioned
+    - Decision: Binary decision. 'Approved' or 'Rejected'.
+    - Amount: The approved monetary value. Only include if the Decision is 'Approved' and an amount is specified.
+    - Justification: A complete explanation for the decision, which must include a direct quotation if any, of the supporting policy clause(s) and checkpoints neccessary.
     """
     
     structured_model = MODEL.with_structured_output(Output)
@@ -158,6 +191,7 @@ graph.add_node("output-structurer", OutputStructurer)
 graph.add_node("tools", tool_node)
 
 graph.add_edge(START, "query-refiner")
+graph.add_edge("initialise-model", "decision-maker")
 graph.add_edge("tools", "decision-maker")
 
 app = graph.compile(checkpointer=memory)
@@ -166,18 +200,12 @@ config = {"configurable" : {
     "thread_id" : 1
 }}
 
-for filename in os.listdir(PATH):
-    file_path = os.path.join(PATH, filename)
-    if os.path.isfile(file_path):
-        try:
-            VECTORSTORE.store_file(file_path, filename)
-            print(f"Successfully processed: {filename}")
-        except Exception as e:
-            print(f"Error processing {filename}: {str(e)}")
+# Use the new process_directory method with intelligent caching
+print("Starting document processing...")
+VECTORSTORE.process_directory(PATH)
+print("Document processing completed!")
 
-print("Document loading completed!")
-
-prompt = input("Enter Prompt: (EX- 46M, knee surgery, Pune, 3-month policy)") #f"46M, knee surgery, Pune, 3-month policy"
+prompt = input("Enter Prompt-> (EX- 46M, knee surgery, Pune, 3-month old policy)\n:") #f"46M, knee surgery, Pune, 3-month policy" #f"46M, knee surgery, Pune, 3-month policy"
 
 for event in app.stream({"query": prompt, "messages": []}, config=config, stream_mode="updates"):
     node_name = list(event.keys())[0]
@@ -201,3 +229,33 @@ for event in app.stream({"query": prompt, "messages": []}, config=config, stream
             print(f"🔹 REFINED QUERY: {value}")
         else:
             pass
+
+# Utility functions for cache management
+def clear_cache():
+    """Clear the vectorstore cache - use this if you want to force rebuild"""
+    VECTORSTORE.clear_vectorstore()
+    print("Cache cleared. Next run will process all files fresh.")
+
+def show_cache_info():
+    """Show information about the current cache state"""
+    info = VECTORSTORE.get_cache_info()
+    print("\n=== Cache Information ===")
+    print(f"Vectorstore loaded: {info['vectorstore_exists']}")
+    print(f"Cache directory: {info['cache_directory']}")
+    print(f"Cached files count: {info['cached_files_count']}")
+    if info['cached_files']:
+        print("Cached files:")
+        for file in info['cached_files']:
+            print(f"  - {file}")
+    print("========================\n")
+
+def force_rebuild():
+    """Force rebuild of vectorstore from all files"""
+    print("Force rebuilding vectorstore...")
+    VECTORSTORE.process_directory(PATH, force_rebuild=True)
+    print("Force rebuild completed!")
+
+# Uncomment any of these lines to use the utility functions:
+# show_cache_info()
+# clear_cache()
+# force_rebuild()
